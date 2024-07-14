@@ -101,17 +101,27 @@ class JointEncoding(nn.Module):
             weights: [N_rays, N_samples]
         '''
         # ********************* 根据论文公式(5)用两个sigmoid计算权重 *********************
+        # 计算每个采样点的权重：正方向权重 和 负方向权重 相乘
         weights = torch.sigmoid(sdf / args['training']['trunc']) * torch.sigmoid(-sdf / args['training']['trunc'])
-
+        
+        #！找到过渡点
+        # 找到SDF从正到负的过渡点
         signs = sdf[:, 1:] * sdf[:, :-1] # [2048,84] 相邻2个SDF之间是否发生符号变化
         # 找到SDF符号发生变化的部分。mask设为1，否则设为0  [2048,84]
         mask = torch.where(signs < 0.0, torch.ones_like(signs), torch.zeros_like(signs))
+        
+        # 每条射线上的第一个符号变化点（也就是过渡点）
         inds = torch.argmax(mask, axis=1) # 在每一行查找最大值的索引  [2048]
         inds = inds[..., None] # [2048,1]
+        
+        #！处理过渡点之前的采样点
+        # 每条射线上第一个过渡点的深度值
         z_min = torch.gather(z_vals, 1, inds) # The first surface [2048,1] 获取第一个表面的z值
+        # 第一个过渡点之前的所有采样点
         mask = torch.where(z_vals < z_min + args['data']['sc_factor'] * args['training']['trunc'], torch.ones_like(z_vals), torch.zeros_like(z_vals))
-
+        # 将第一个过渡点之前的采样点权重置为0
         weights = weights * mask
+        # 归一化
         return weights / (torch.sum(weights, axis=-1, keepdims=True) + 1e-8)
     
     # 内部函数
@@ -128,17 +138,20 @@ class JointEncoding(nn.Module):
             acc_map: [N_rays]
             weights: [N_rays, N_samples]
         '''
+        # 原始输出的前三个通道应用sigmoid函数，将原始输出映射到[0，1]范围内,得到RGB颜色值
         rgb = torch.sigmoid(raw[...,:3])  # raw光线的前三列是 rgb值 [N_rays, N_samples, 3]  [2048,85,3]
         # 通过raw的第四列深度值sdf,得到论文公式5的权重  [2048,85]
         weights = self.sdf2weights(raw[..., 3], z_vals, args=self.config)
         
         # ********************* 根据论文公式(4)计算rendering颜色和深度 *********************
+        # 每个采样点的RGB颜色值和相应的权重相乘并求和，得到最终的RGB图像
         rgb_map = torch.sum(weights[...,None] * rgb, -2)  # 论文4式，计算rgb图 [N_rays, 3] [2048,3]
+        # 深度值乘以权重并再求和
         depth_map = torch.sum(weights * z_vals, -1) # 论文4式，计算深度图    [2048]
 
-        # 深度方差,表示每条射线深度的变化情况
+        # 深度方差,表示每条射线深度的变化情，深度方差图：每个采样点深度-平均深度
         depth_var = torch.sum(weights * torch.square(z_vals - depth_map.unsqueeze(-1)), dim=-1)
-        # 视差图disparity map,相机到物体的距离的倒数,表达物体的远近
+        # 视差图 disparity map, 相机到物体的距离的倒数,表达物体的远近
         disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
         acc_map = torch.sum(weights, -1) # 累积权重图，表示沿每条射线的累积权重
 
@@ -210,15 +223,19 @@ class JointEncoding(nn.Module):
         Returns:
             outputs: [N_rays, N_samples, 4]
         """
+        # 将input变为二维张量
         inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]]) # [174080,3] <=== [2048,85,3]
         
-        # Normalize the input to [0, 1] (TCNN convention)归一化处理 2048根射线,每根射线85个采样点到[0,1]
+        # Normalize the input to [0, 1] (TCNN convention)
+        # 归一化处理，归一化的范围由场景的边界框大小决定 2048根射线,每根射线85个采样点到[0,1]
         if self.config['grid']['tcnn_encoding']:
             inputs_flat = (inputs_flat - self.bounding_box[:, 0]) / (self.bounding_box[:, 1] - self.bounding_box[:, 0])
 
         # 将inputs_flat分成较小的批次，然后对每个批次使用query_color_sdf函数(也就是encoder+decoder网络)
         # 得到每个点的深度和颜色信息
+        # 调用query_color_sdf执行网络模型的预测
         outputs_flat = batchify(self.query_color_sdf, None)(inputs_flat)
+        # 将out_puts重现编整为和inputs相同的shape：[N_rays, N_samples, 4]
         outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
 
         return outputs
@@ -274,10 +291,14 @@ class JointEncoding(nn.Module):
             # 将目标深度为负的那些取样点改为在深度near到far的范围内生成n_range_d==21个等间隔张量
             z_samples[target_d.squeeze()<=0] = torch.linspace(self.config['cam']['near'], self.config['cam']['far'], steps=self.config['training']['n_range_d']).to(target_d) 
 
+            '''
+            training:
+                n_samples_d: 64
+            '''
             if self.config['training']['n_samples_d'] > 0:
                 # 再在深度near=0到far=5的范围内生成n_samples_d=64个取样点
                 z_vals = torch.linspace(self.config['cam']['near'], self.config['cam']['far'], self.config['training']['n_samples_d'])[None, :].repeat(n_rays, 1).to(rays_o)
-                # 将[2048,64]的z_vals和[2048,21]的z_samples合并，然后按照深度值进行排序。这将确保深度值是有序的
+                # 将[2048,64]的z_vals和[2048,21]的z_samples合并得到最终的‘z_vals’，然后按照深度值进行排序。这将确保深度值是有序的
                 z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
             else:
                 z_vals = z_samples
@@ -289,40 +310,58 @@ class JointEncoding(nn.Module):
         # ********************* 给取样点的深度添加扰动 *********************
         # C. 是否要进行深度扰动
         if self.config['training']['perturb'] > 0.:
+            # 对深度采样进行扰动： 优化z_vel
             mids = .5 * (z_vals[...,1:] + z_vals[...,:-1]) # [2048,84]
             upper = torch.cat([mids, z_vals[...,-1:]], -1) # [2048,85]
             lower = torch.cat([z_vals[...,:1], mids], -1)  # [2048,85]
             z_vals = lower + (upper - lower) * torch.rand(z_vals.shape).to(rays_o)
 
         # ********************* 通过encoding和decoder网络,计算深度和颜色，得到图 *********************
-        # D. 执行神经网络渲染
+        # D. Run rendering pipeline 粗采样：第一次渲染
         # 每条射线取样点的坐标 [2048,85,3] [N_rays, N_samples, 3]
+        # 计算采样点 = 原点 + 射线方向 * 深度采样 采样点维度： [射线数量，每个射线的采样点个数，(x, y, z)]
         pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
+        # 运行网络
         raw = self.run_network(pts) # 使用encoding和decoder网络,计算得到每根光线的每个采样点的深度和颜色    [2048, 85, 4]
         # E. 将原始数据转换为具体的渲染结果，如RGB图像、深度图、不透明度累积和深度方差
         # 将上面算出的每个采样点的深度和颜色原始信息,转换为rgb图，视差图，累积权重图，权重，深度图，深度方差
+        # 处理渲染结果
         rgb_map, disp_map, acc_map, weights, depth_map, depth_var = self.raw2outputs(raw, z_vals, self.config['training']['white_bkgd'])
 
         # Importance sampling，yaml里默认是0，不执行
-        # ********************* 重要点采样 *********************
+        # ********************* 细采样：第二次渲染 *********************
         # ? 论文Depth-guided Sampling处说Importance sampling没什么效果,还降低slam速度,所以不用
         if self.config['training']['n_importance'] > 0:
-
+            # 备份原始渲染结果
             rgb_map_0, disp_map_0, acc_map_0, depth_map_0, depth_var_0 = rgb_map, disp_map, acc_map, depth_map, depth_var
 
+            # 计算中间深度值 每个采样点深度间隔的中点
             z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
+            # 用sample_pdf对中间深度值进行采样，采样的数量由配置文件参数决定
+            #? 在深度方向上对采样点重新分布，集中采集对最终结果贡献大的区域(采用线性插值)
             z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], self.config['training']['n_importance'], det=(self.config['training']['perturb']==0.))
             z_samples = z_samples.detach()
 
+            # 将原始深度值‘z_vals’与重新采样得到的‘z_samples’拼接，后排序
             z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
+            # 重新计算渲染结果：pts采样点的位置
             pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
-
+            # 运行网络
             raw = self.run_network(pts)
+            # 处理渲染结果
             rgb_map, disp_map, acc_map, weights, depth_map, depth_var = self.raw2outputs(raw, z_vals, self.config['training']['white_bkgd'])
 
         # ********************* 记录返回值 *********************
         # Return rendering outputs: rgb图，深度图，视差图，累积权重图，深度方差, 所有采样点的深度
         # F. Return rendering outputs, 返回一个字典，包含RGB图像、深度图、不透明度累积和深度方差等的结果
+        # 以字典的形式返回渲染结果
+        '''
+            'rgb' : 像素的颜色值
+            'depth' : 像素的深度值
+            'disp_map' : 相机观察点中不同像素之间的距离，视差
+            'acc_map' : 累积光照度图
+            'depth_var': 深度的方差，深度估计的不确定性
+        '''
         ret = {'rgb' : rgb_map, 'depth' :depth_map, 
                'disp_map' : disp_map, 'acc_map' : acc_map, 
                'depth_var':depth_var,}
@@ -362,13 +401,20 @@ class JointEncoding(nn.Module):
         if not self.training:
             return rend_dict
         
+        # Get depth and rgb weights for loss
+        # 0 < target_d < 阈值 创建一个掩码
         valid_depth_mask = (target_d.squeeze() > 0.) * (target_d.squeeze() < self.config['cam']['depth_trunc'])
+        # 复制给rgb_weight并扩展维度
         rgb_weight = valid_depth_mask.clone().unsqueeze(-1)
+        # 将掩码中的0替换为rgb_missing
         rgb_weight[rgb_weight==0] = self.config['training']['rgb_missing']
 
         # ********************* 根据论文公式(6)计算颜色和深度的损失函数 *********************
         # 从rend_dict字典里取值
+        # Get render loss
+        # rend_dict是渲染出的RGB图像，target_rgb是目标RGB图像
         rgb_loss = compute_loss(rend_dict["rgb"]*rgb_weight, target_rgb*rgb_weight)
+        # 计算PSNR 峰值信噪比，用于衡量图像质量，越高越好
         psnr = mse2psnr(rgb_loss)
         depth_loss = compute_loss(rend_dict["depth"].squeeze()[valid_depth_mask], target_d.squeeze()[valid_depth_mask])
 
@@ -377,6 +423,7 @@ class JointEncoding(nn.Module):
             depth_loss += compute_loss(rend_dict["depth0"][valid_depth_mask], target_d.squeeze()[valid_depth_mask])
         
         # ********************* 根据论文公式(7)和(8)计算sdf和free-space损失 *********************
+        # Get sdf loss
         z_vals = rend_dict['z_vals']  # [N_rand, N_samples + N_importance]
         sdf = rend_dict['raw'][..., -1]  # [N_rand, N_samples + N_importance]
         truncation = self.config['training']['trunc'] * self.config['data']['sc_factor']

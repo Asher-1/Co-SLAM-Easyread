@@ -35,34 +35,56 @@ def sample_pdf(bins, weights, N_importance, det=False, eps=1e-5):
     Return:
         samples: torch.Tensor, (Bs, N_importance)
     '''
+    #! 准备数据
     # device = weights.get_device()
     device = weights.device
     # Get pdf
+    # 加入很小的常数，避免出现0
     weights = weights + 1e-5  # prevent nans
+    
+    #! 计算pdf和cdf
     pdf = weights / torch.sum(weights, -1, keepdim=True) # Bs, N_samples-2
+    # 计算概率分布函数： pdf的累积和
     cdf = torch.cumsum(pdf, -1) 
     cdf = torch.cat([torch.zeros_like(cdf[..., :1], device=device), cdf], -1) # Bs, N_samples-1
-    # Take uniform samples
-    if det:
-        u = torch.linspace(0. + 0.5 / N_importance, 1. - 0.5 / N_importance, steps=N_importance, device=device)
-        u = u.expand(list(cdf.shape[:-1]) + [N_importance])
-    else:
-        u = torch.rand(list(cdf.shape[:-1]) + [N_importance], device=device)
 
-    # Invert CDF
-    u = u.contiguous()
+    #! Take uniform samples 采样均匀分布
+    if det: # 确定采样
+        u = torch.linspace(0. + 0.5 / N_importance, 1. - 0.5 / N_importance, steps=N_importance, device=device)
+        # 将u扩展为与cdf相同形状的张量
+        u = u.expand(list(cdf.shape[:-1]) + [N_importance])
+    else: # 随机采样
+        u = torch.rand(list(cdf.shape[:-1]) + [N_importance], device=device)
+    
+    #! Invert CDF 反转概率分布函数
+    u = u.contiguous() # 确保存储方式连续
+    # 查找CDF中每个采样点u所在的区间，right=True 右边界，找到的是大于等于u的第一个位置，inds存储每个右边界的索引
     inds = torch.searchsorted(cdf, u, right=True)
+    # below：u所在的区间的左边界，计算ind-1和0的最大值，确保左边界不超过CDF的有效范围
     below = torch.max(torch.zeros_like(inds - 1), inds - 1)
+    # above：u所在的区间的右边界，计算cdf和inds的最大值，确保右边界不超过CDF的有效范围
     above = torch.min((cdf.shape[-1] - 1) * torch.ones_like(inds), inds)
+    # 得到左右边界索引
     inds_g = torch.stack([below, above], -1)  # (batch, N_samples, 2)
 
     matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
+    '''
+        matched_shape: (batch, N_samples, N_samples)
+        cdf: (batch, N_samples) -> (batch, 1, N_samples) -> (batch, N_samples, 1)
+        cdf_g: (batch, N_samples, 2)
+    '''
+    # 扩展cdf和bins的维度，使其与inds_g的维度相同
     cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g)
     bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)
 
+    #! 计算采样点
+    # 计算斜率
     denom = (cdf_g[..., 1] - cdf_g[..., 0])
+    # 避免出现0
     denom = torch.where(denom < 1e-5, torch.ones_like(denom, device=device), denom)
+    # 计算t：标准化，t表示采样点在bins_g中的相对位置
     t = (u - cdf_g[..., 0]) / denom
+    # 根据t计算采样点：线性插值
     samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
 
     return samples
