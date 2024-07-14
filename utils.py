@@ -162,7 +162,7 @@ def colormap_image(
         vmin=None,
         vmax=None,
         return_vminvmax=False,
-        colormap="turbo",
+        colormap="turbo",   # turbo:一种颜色映射，在低值区域使用暖色调（如红色、橙色），在高值区域使用冷色调（如蓝色、绿色），并且具有明显的亮度变化，以增强数据的对比度。
 ):
     """
     Colormaps a one channel tensor using a matplotlib colormap.
@@ -181,27 +181,31 @@ def colormap_image(
         image_cm_3hw: image of the colormapped tensor.
         vmin, vmax: returned when return_vminvmax is true.
     """
+    # 是否有一个额外的掩码mask_1hw, 用来确定有效区域
+    # 默认为None，即整个输入进来的张量image_1hw都是有效区域
+    # 否则，张量mask_1hw的每一个值为！=0的都是有效区域
     valid_vals = image_1hw if mask_1hw is None else image_1hw[mask_1hw.bool()]
     if vmin is None:
-        vmin = valid_vals.min()
+        vmin = valid_vals.min() # 0
     if vmax is None:
-        vmax = valid_vals.max()
+        vmax = valid_vals.max() # 2.0256
 
-    cmap = torch.Tensor(
-        plt.cm.get_cmap(colormap)(
-            torch.linspace(0, 1, 256)
-        )[:, :3]
+    # 将颜色映射turbo插值得到的颜色转换为 PyTorch 张量  
+    cmap = torch.Tensor(                # [256,3]
+        plt.cm.get_cmap(colormap)(      # 获得颜色映射类型，这里是turbo
+            torch.linspace(0, 1, 256)   # 创建256个0-1等间隔的值，代表颜色映射的插值
+        )[:, :3]                        # 只取前面3个通道，即rgb，不要第4个通道:透明度
     ).to(image_1hw.device)
     if flip:
-        cmap = torch.flip(cmap, (0,))
+        cmap = torch.flip(cmap, (0,))   # 在维度0上将上面这个张量进行翻转
 
-    h, w = image_1hw.shape[1:]
+    h, w = image_1hw.shape[1:]          # 图片的高宽 h:368, w:496
 
-    image_norm_1hw = (image_1hw - vmin) / (vmax - vmin)
-    image_int_1hw = (torch.clamp(image_norm_1hw * 255, 0, 255)).byte().long()
+    image_norm_1hw = (image_1hw - vmin) / (vmax - vmin)                         # 归一化图片的像素/深度等信息   [1, 368, 496]
+    image_int_1hw = (torch.clamp(image_norm_1hw * 255, 0, 255)).byte().long()   # 将归一化值映射到0-255       [1, 368, 496]
 
-    image_cm_3hw = cmap[image_int_1hw.flatten(start_dim=1)
-    ].permute([0, 2, 1]).view([-1, h, w])
+    image_cm_3hw = cmap[image_int_1hw.flatten(start_dim=1)                      # 将归一化的图像像素值映射为颜色，并将其转换为颜色图像。    [3, 368, 496]
+    ].permute([0, 2, 1]).view([-1, h, w])                                       # permute()重新排列，view()将重新排列的颜色值变形为一个新的形状
 
     if mask_1hw is not None:
         invalid_color = torch.Tensor(invalid_color).view(3, 1, 1).to(image_1hw.device)
@@ -211,8 +215,4 @@ def colormap_image(
         return image_cm_3hw, vmin, vmax
     else:
         return image_cm_3hw
-
-
-
-
 

@@ -235,7 +235,8 @@ class CoSLAM():
 
         # Training
         for i in range(self.config['mapping']['cur_frame_iters']):
-            self.cur_map_optimizer.zero_grad()
+            # ********************* 从数据集获得当前帧每个像素的颜色，深度，方向观测值 *********************
+            self.cur_map_optimizer.zero_grad()  # 将之前的梯度信息清零
             indice = self.select_samples(self.dataset.H, self.dataset.W, self.config['mapping']['sample'])
             
             indice_h, indice_w = indice % (self.dataset.H), indice // (self.dataset.H)
@@ -243,17 +244,20 @@ class CoSLAM():
             target_s = batch['rgb'].squeeze(0)[indice_h, indice_w, :].to(self.device)
             target_d = batch['depth'].squeeze(0)[indice_h, indice_w].to(self.device).unsqueeze(-1)
 
+            # ********************* 根据位姿估计计算射线的原点和方向 *********************
             rays_o = c2w[None, :3, -1].repeat(self.config['mapping']['sample'], 1)
             rays_d = torch.sum(rays_d_cam[..., None, :] * c2w[:3, :3], -1)
 
             # Sec 3.2 Ray Sampling 藏在self.model.forward里
+            # ********************* 前向传播: 得到rgb图，深度图，rgb损失，深度损失,sdf损失，fs损失 *********************
             ret = self.model.forward(rays_o, rays_d, target_s, target_d)
             loss = self.get_loss_from_ret(ret)
+            # ********************* 反响传播: 优化encoder/decoder网络的参数 *********************
             loss.backward()
             self.cur_map_optimizer.step()
         
         
-        return ret, loss
+        return ret, loss  # 返回: rgb图，深度图，rgb损失，深度损失,sdf损失，fs损失 
 
     def smoothness(self, sample_points=256, voxel_size=0.1, margin=0.05, color=False):
         '''
@@ -283,8 +287,8 @@ class CoSLAM():
     
     def get_pose_param_optim(self, poses, mapping=True):
         task = 'mapping' if mapping else 'tracking'
-        cur_trans = torch.nn.parameter.Parameter(poses[:, :3, 3])
-        cur_rot = torch.nn.parameter.Parameter(self.matrix_to_tensor(poses[:, :3, :3]))
+        cur_trans = torch.nn.parameter.Parameter(poses[:, :3, 3]) # 提取变换矩阵的t
+        cur_rot = torch.nn.parameter.Parameter(self.matrix_to_tensor(poses[:, :3, :3])) # 提取变换矩阵的R
         pose_optimizer = torch.optim.Adam([{"params": cur_rot, "lr": self.config[task]['lr_rot']},
                                                {"params": cur_trans, "lr": self.config[task]['lr_trans']}])
         
@@ -435,17 +439,18 @@ class CoSLAM():
         Predict current pose from previous pose using camera motion model
         '''
         # 特殊处理：第一帧或者非恒速，直接使用上一帧的相机姿态作为当前帧的预测姿态
-        if frame_id == 1 or (not constant_speed):
-            c2w_est_prev = self.est_c2w_data[frame_id-1].to(self.device)
-            self.est_c2w_data[frame_id] = c2w_est_prev
+        if frame_id == 1 or (not constant_speed): # 第0帧已用于初始训练encoder和decoder网络
+            c2w_est_prev = self.est_c2w_data[frame_id-1].to(self.device) # 此时，读取第0帧的位姿
+            self.est_c2w_data[frame_id] = c2w_est_prev # 作为第1帧的位姿估计
             
         # 恒速运动模型，使用前两帧的相机姿态来预测当前帧的姿态    
         else:
-            c2w_est_prev_prev = self.est_c2w_data[frame_id-2].to(self.device)
-            c2w_est_prev = self.est_c2w_data[frame_id-1].to(self.device)
+            # 对于后面的帧使用论文的公式10,来初始化当前帧的位姿估计
+            c2w_est_prev_prev = self.est_c2w_data[frame_id-2].to(self.device)  # 第i-2帧的位姿
+            c2w_est_prev = self.est_c2w_data[frame_id-1].to(self.device)       # 第i-1帧的位姿
             # 估算前前帧和前帧的delta，将delta运用到前帧上得到当前帧
-            delta = c2w_est_prev@c2w_est_prev_prev.float().inverse()
-            self.est_c2w_data[frame_id] = delta@c2w_est_prev
+            delta = c2w_est_prev@c2w_est_prev_prev.float().inverse()           # T1 * T2^-1 
+            self.est_c2w_data[frame_id] = delta@c2w_est_prev                   # T1 * T2^-1 * T1
         
         return self.est_c2w_data[frame_id]
 
